@@ -2,20 +2,30 @@ import { NextRequest, NextResponse } from "next/server";
 
 export async function POST(req: NextRequest) {
   try {
-    const { text, voiceId } = await req.json();
+    const body = await req.json();
+    const { text, voiceId, elevenlabsApiKey } = body;
 
     if (!text || typeof text !== "string" || !text.trim()) {
       return NextResponse.json({ error: "Text is required" }, { status: 400 });
     }
 
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const selectedVoiceId = voiceId || process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Rachel
+    const apiKey =
+      elevenlabsApiKey ||
+      req.headers.get("x-elevenlabs-key") ||
+      process.env.ELEVENLABS_API_KEY;
+
+    const selectedVoiceId =
+      voiceId ||
+      req.headers.get("x-voice-id") ||
+      process.env.ELEVENLABS_VOICE_ID ||
+      "21m00Tcm4TlvDq8ikWAM"; // Rachel (calm bedtime voice)
 
     if (!apiKey) {
       return NextResponse.json(
         {
-          error: "ELEVENLABS_API_KEY is not configured. Falling back to visual/browser speech.",
+          error: "ELEVENLABS_API_KEY is not configured. Falling back to visual and soft browser speech.",
           fallback: true,
+          voiceId: selectedVoiceId,
         },
         { status: 400 }
       );
@@ -33,9 +43,9 @@ export async function POST(req: NextRequest) {
         text: text.trim(),
         model_id: "eleven_turbo_v2_5",
         voice_settings: {
-          stability: 0.75,
+          stability: 0.8,
           similarity_boost: 0.85,
-          style: 0.2,
+          style: 0.25,
           use_speaker_boost: true,
         },
       }),
