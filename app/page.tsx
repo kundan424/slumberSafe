@@ -25,7 +25,7 @@ import {
   Coffee,
 } from "lucide-react";
 
-type UIState = "IDLE" | "CONVERSING" | "PROCESSING" | "PLAYING_AUDIO" | "MORNING_VIEW";
+type UIState = "IDLE" | "AI_SPEAKING" | "LISTENING" | "PROCESSING" | "SESSION_COMPLETE" | "MORNING_VIEW";
 
 interface ConversationTurn {
   role: "user" | "assistant";
@@ -34,9 +34,12 @@ interface ConversationTurn {
 }
 
 interface DebriefData {
-  comforting_response: string;
-  parked_tasks: string[];
-  story_text: string;
+  assistant_response: string;
+  tasks: Array<{ text: string; priority: string }>;
+  next_question: string;
+  session_complete: boolean;
+  should_offer_story: boolean;
+  story_text?: string;
 }
 
 interface TaskItem {
@@ -144,6 +147,7 @@ export default function SlumberSafePage() {
     isAiSpeakingRef.current = true;
 
     const finalize = () => {
+      console.log("[AUDIO] playback ended");
       setIsAiSpeaking(false);
       isAiSpeakingRef.current = false;
       if (onEnd) onEnd();
@@ -174,6 +178,7 @@ export default function SlumberSafePage() {
         audioRef.current = audio;
         audio.onended = finalize;
         audio.onerror = finalize;
+        console.log("[AUDIO] playback started");
         audio.play().catch(finalize);
       })
       .catch(() => {
@@ -193,6 +198,7 @@ export default function SlumberSafePage() {
           if (softVoice) utterance.voice = softVoice;
           utterance.onend = finalize;
           utterance.onerror = finalize;
+          console.log("[AUDIO] playback started (fallback TTS)");
           window.speechSynthesis.speak(utterance);
         } else {
           finalize();
@@ -202,6 +208,7 @@ export default function SlumberSafePage() {
 
   // Continuous speech recognition with anti-echo and silence detection
   const startListening = () => {
+    console.log("[VOICE] recognition started");
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -239,7 +246,7 @@ export default function SlumberSafePage() {
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
           if (updated.length > 6) {
             silenceTimerRef.current = setTimeout(() => {
-              console.log("[STT] Final transcript captured:", updated);
+              console.log("[VOICE] final transcript:", updated);
               setIsUserSpeaking(false);
               handleSendTurn(updated);
             }, 3200);
@@ -254,9 +261,10 @@ export default function SlumberSafePage() {
       };
 
       recognition.onend = () => {
+        console.log("[VOICE] recognition stopped");
         setIsUserSpeaking(false);
-        // Automatically restart listening if still in CONVERSING state, not speaking, and not processing
-        if (uiState === "CONVERSING" && !isAiSpeakingRef.current && !isProcessingRef.current) {
+        // Automatically restart listening if still in LISTENING state
+        if (!isAiSpeakingRef.current && !isProcessingRef.current) {
           try {
             recognition.start();
           } catch {}
@@ -293,15 +301,16 @@ export default function SlumberSafePage() {
     setAllParkedTasks([]);
     setFinalDebrief(null);
     setCurrentInput("");
-    setUiState("CONVERSING");
+    setUiState("AI_SPEAKING");
 
-    const greeting = "I'm here. Take your time and tell me what's on your mind.";
+    const greeting = "Let's slow things down for a moment. How was your day?";
 
     // Add greeting to conversation feed
     setConversation([{ role: "assistant", content: greeting }]);
 
     // Speak greeting, then automatically begin listening for user response
     speakBedsideAudio(greeting, () => {
+      setUiState("LISTENING");
       startListening();
     });
   };
@@ -316,8 +325,10 @@ export default function SlumberSafePage() {
     const textToSend = (inputText !== undefined ? inputText : currentInput).trim();
     if (!textToSend && !forceSleep) return;
 
+    console.log("[DEBRIEF] request sent");
     // Temporarily pause listening while AI is thinking
     isProcessingRef.current = true;
+    setUiState("PROCESSING");
     stopListening();
     setCurrentInput("");
 
@@ -345,39 +356,47 @@ export default function SlumberSafePage() {
       });
 
       const data: DebriefData = await res.json();
-      console.log("[DEBRIEF] Response data:", data);
-
+      console.log("[DEBRIEF] response received:", data);
+      
       // Accumulate any extracted tasks
-      if (data.parked_tasks && data.parked_tasks.length > 0) {
-        setAllParkedTasks((prev) => [
-          ...prev,
-          ...data.parked_tasks.filter((t) => !prev.includes(t)),
-        ]);
+      if (data.tasks && data.tasks.length > 0) {
+        const taskStrings = data.tasks.map(t => t.text);
+        console.log("[DEBRIEF] tasks detected:", taskStrings);
+        setAllParkedTasks((prev) => {
+          const newTasks = taskStrings.filter((t) => !prev.includes(t));
+          return [...prev, ...newTasks];
+        });
       }
 
-      // Check if user is ready for sleep story
-      if (data.story_text || forceSleep) {
+      // Check if session is complete
+      if (data.session_complete || forceSleep) {
         setFinalDebrief(data);
-        setUiState("PLAYING_AUDIO");
-        const finalScript = [data.comforting_response, data.story_text]
+        setUiState("SESSION_COMPLETE");
+        const finalScript = [data.assistant_response, data.story_text]
           .filter(Boolean)
           .join(" ");
+        console.log("[TTS] generating response for sleep");
         speakBedsideAudio(finalScript);
       } else {
         // Continue conversation: AI speaks and then prompts user for next turn
+        const fullResponse = [data.assistant_response, data.next_question].filter(Boolean).join(" ");
         setConversation((prev) => [
           ...prev,
           {
             role: "assistant",
-            content: data.comforting_response,
-            tasks: data.parked_tasks,
+            content: fullResponse,
+            tasks: data.tasks?.map(t => t.text),
           },
         ]);
 
-        speakBedsideAudio(data.comforting_response, () => {
+        console.log("[TTS] generating response");
+        setUiState("AI_SPEAKING");
+        speakBedsideAudio(fullResponse, () => {
+          console.log("[SESSION] returning to listening");
           // AI finished speaking; resume listening for user's next thoughts!
           isProcessingRef.current = false;
-          if (uiState === "CONVERSING") startListening();
+          setUiState("LISTENING");
+          startListening();
         });
       }
     } catch (err) {
@@ -385,9 +404,11 @@ export default function SlumberSafePage() {
       const fallbackMsg =
         "Your thoughts are safe with me. Let your mind pause and take a gentle breath.";
       setConversation((prev) => [...prev, { role: "assistant", content: fallbackMsg }]);
+      setUiState("AI_SPEAKING");
       speakBedsideAudio(fallbackMsg, () => {
         isProcessingRef.current = false;
-        if (uiState === "CONVERSING") startListening();
+        setUiState("LISTENING");
+        startListening();
       });
     }
   };
@@ -635,7 +656,7 @@ export default function SlumberSafePage() {
         )}
 
         {/* 2. CONVERSING STATE (Multi-turn Gemini Voice Experience) */}
-        {uiState === "CONVERSING" && (
+        {(uiState === "AI_SPEAKING" || uiState === "LISTENING" || uiState === "PROCESSING") && (
           <div className="flex flex-col space-y-3 h-[72vh]">
             {/* Status Indicator */}
             <div className="flex items-center justify-between bg-zinc-950/90 border border-zinc-800/80 rounded-xl px-3.5 py-2 text-xs">
@@ -765,7 +786,7 @@ export default function SlumberSafePage() {
         )}
 
         {/* 3. PLAYING AUDIO / FINAL SLEEP STATE */}
-        {uiState === "PLAYING_AUDIO" && finalDebrief && (
+        {uiState === "SESSION_COMPLETE" && finalDebrief && (
           <div className="space-y-4 animate-in fade-in duration-500">
             <div className="flex items-center justify-between bg-indigo-950/30 border border-indigo-900/40 rounded-xl px-4 py-3">
               <div className="flex items-center space-x-2.5 text-xs text-indigo-300">
@@ -792,7 +813,7 @@ export default function SlumberSafePage() {
                 <span>Comforting Words</span>
               </span>
               <p className="text-sm text-zinc-200 italic leading-relaxed">
-                &ldquo;{finalDebrief.comforting_response}&rdquo;
+                &ldquo;{finalDebrief.assistant_response}&rdquo;
               </p>
             </div>
 
@@ -837,7 +858,7 @@ export default function SlumberSafePage() {
               <button
                 onClick={() => {
                   const speechScript = [
-                    finalDebrief.comforting_response,
+                    finalDebrief.assistant_response,
                     finalDebrief.story_text,
                   ]
                     .filter(Boolean)

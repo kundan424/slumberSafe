@@ -16,8 +16,11 @@ interface DebriefRequestBody {
 }
 
 interface DebriefResponse {
-  comforting_response: string;
-  parked_tasks: string[];
+  assistant_response: string;
+  tasks: Array<{ text: string; priority: string }>;
+  next_question: string;
+  session_complete: boolean;
+  should_offer_story: boolean;
   story_text: string;
 }
 
@@ -27,7 +30,7 @@ function generateDynamicDebrief(
   storyTopic: string,
   isReadyForSleep: boolean
 ): DebriefResponse {
-  const tasks: string[] = [];
+  const extractedTasks: string[] = [];
   const lastUserMessage = messages.slice().reverse().find(m => m.role === "user")?.content || "";
   const text = lastUserMessage.trim();
   const lower = text.toLowerCase();
@@ -49,14 +52,14 @@ function generateDynamicDebrief(
         ""
       );
       const formatted = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
-      if (formatted.length > 3 && !tasks.includes(formatted)) {
-        tasks.push(formatted);
+      if (formatted.length > 3 && !extractedTasks.includes(formatted)) {
+        extractedTasks.push(formatted);
       }
     }
   }
 
   // If user entered short direct to-do item
-  if (tasks.length === 0 && text.length > 0) {
+  if (extractedTasks.length === 0 && text.length > 0) {
     const lines = text.split(/[.\n;]+/).map((s) => s.trim()).filter((s) => s.length > 3);
     for (const line of lines) {
       if (
@@ -65,38 +68,47 @@ function generateDynamicDebrief(
         ) ||
         (line.length <= 60 && !/^(no|yes|nothing|goodnight|sleep|ready)/i.test(line))
       ) {
-        tasks.push(line.charAt(0).toUpperCase() + line.slice(1));
+        extractedTasks.push(line.charAt(0).toUpperCase() + line.slice(1));
       }
     }
   }
 
   const wantsSleep =
     isReadyForSleep ||
-    /\b(sleep|story|goodnight|ready to sleep|no that's all|nothing else|that is all|that's it|all for tonight)\b/i.test(
+    /\b(sleep|story|goodnight|ready to sleep|no that's all|nothing else|that is all|that's it|all for tonight|done)\b/i.test(
       lower
     );
 
-  let comforting_response = "";
+  let assistant_response = "";
   let story_text = "";
+  let next_question = "";
+  let session_complete = false;
 
   if (wantsSleep) {
-    comforting_response =
+    session_complete = true;
+    assistant_response =
       "Your mind has emptied everything it needed to tonight. Close your eyes, let your shoulders melt into bed, and listen as the quiet night carries you into sleep.";
     const topic = storyTopic.trim() || "a quiet rainy harbor in Maine";
     story_text = `Picture ${topic.toLowerCase()}. Soft, rhythmic whispers of evening mist drift slowly through the quiet air. A gentle, reassuring warmth settles all around you, easing away every lingering thought of today. Every breath you take grows deeper, slower, and lighter as stillness blankets the room. The world outside is peaceful, your tasks are locked safely away, and your mind is completely free to rest.`;
   } else {
-    if (tasks.length > 0) {
-      comforting_response = `I've saved those ${tasks.length} task${tasks.length > 1 ? "s" : ""} for tomorrow. You don't need to carry them tonight.`;
+    if (extractedTasks.length > 0) {
+      assistant_response = `I've saved those ${extractedTasks.length} task${extractedTasks.length > 1 ? "s" : ""} for tomorrow. You don't need to carry them tonight.`;
+      next_question = "What else is on your mind?";
     } else if (text.length > 0) {
-      comforting_response = `I hear you. It's safe to set that down now.`;
+      assistant_response = `I hear you. It's safe to set that down now.`;
+      next_question = "Is there anything else you want to talk about?";
     } else {
-      comforting_response = "Take your time. I'm listening.";
+      assistant_response = "Take your time.";
+      next_question = "I'm listening.";
     }
   }
 
   return {
-    comforting_response,
-    parked_tasks: tasks.slice(0, 5),
+    assistant_response,
+    tasks: extractedTasks.slice(0, 5).map(t => ({ text: t, priority: "normal" })),
+    next_question,
+    session_complete,
+    should_offer_story: wantsSleep,
     story_text,
   };
 }
@@ -127,9 +139,10 @@ export async function POST(req: NextRequest) {
         storyTopic,
         isReadyForSleep
       );
-      if (dynamicResult.parked_tasks.length > 0) {
+      if (dynamicResult.tasks.length > 0) {
         try {
-          await saveParkedTasks(dynamicResult.parked_tasks, mongoUri);
+          const taskStrings = dynamicResult.tasks.map(t => t.text);
+          await saveParkedTasks(taskStrings, mongoUri);
         } catch (dbErr) {
           console.warn("Error saving tasks to storage:", dbErr);
         }
@@ -150,16 +163,20 @@ Your personality:
 - Keep your responses short (1-2 sentences). The user is trying to sleep.
 
 Your goals:
-1. Empathize with their thoughts in 1-2 calm, conversational sentences. Reassure them that tomorrow will be fine.
-2. Extract any concrete, actionable tasks from what they said and put them in the "parked_tasks" array. If none, return [].
-3. Check if the user is ready to sleep (they explicitly say "goodnight", "ready to sleep", "tell me a story", or isReadyForSleep is true):
-   - If they ARE ready to sleep: set "story_text" to a peaceful 100-word low-stimulation bedtime scene based on the topic. Provide a very short comforting_response inviting them to close their eyes.
-   - If they are NOT yet ready for sleep: acknowledge their thoughts briefly and naturally pause. Leave "story_text" empty. DO NOT forcefully push for a sleep story if they are just venting.
+1. Empathize with their thoughts in 1-2 calm, conversational sentences in "assistant_response". Reassure them that tomorrow will be fine.
+2. Extract any concrete, actionable tasks from what they said and put them in the "tasks" array. If none, return []. DO NOT talk about the tasks mechanically, just reassure them that it's safe for tomorrow.
+3. Determine the "next_question" to keep the conversation flowing naturally if they have more on their mind, or leave it empty if the session is ending.
+4. Check if the user is ready to sleep (they explicitly say "goodnight", "ready to sleep", "done", "that's all", or isReadyForSleep is true):
+   - If they ARE ready to sleep: set "session_complete" to true and "should_offer_story" to true. Generate a peaceful 100-word bedtime scene in "story_text" based on the topic. Provide a very short "assistant_response" inviting them to close their eyes.
+   - If they are NOT yet ready for sleep: acknowledge their thoughts briefly. Leave "story_text" empty, "should_offer_story" false, and "session_complete" false. DO NOT forcefully push for a sleep story if they are just venting.
 
 Output must strictly match this JSON schema:
 {
-  "comforting_response": "1-2 warm conversational sentences. (DO NOT ask for a story topic unless they are ready for sleep)",
-  "parked_tasks": ["task 1", "task 2"],
+  "assistant_response": "1-2 warm conversational sentences.",
+  "tasks": [{"text": "task 1", "priority": "normal"}],
+  "next_question": "A short, natural follow-up question, or empty if ending.",
+  "session_complete": boolean,
+  "should_offer_story": boolean,
   "story_text": "100-word calming story if ready for sleep, otherwise empty string."
 }`;
 
@@ -179,7 +196,7 @@ Output must strictly match this JSON schema:
     if (isReadyForSleep) {
       formattedMessages.push({
         role: "system",
-        content: `Hint: The user clicked 'Ready for Sleep Story'. Generate the story now using topic: "${storyTopic || "gentle rain"}".`,
+        content: `Hint: The user clicked 'Ready for Sleep Story'. Generate the story now using topic: "${storyTopic || "gentle rain"}". Set session_complete: true and should_offer_story: true.`,
       });
     }
 
@@ -201,7 +218,7 @@ Output must strictly match this JSON schema:
     
     console.log("[DEBRIEF] LLM Raw Response:", rawContent);
 
-    let parsed: DebriefResponse;
+    let parsed: any;
     try {
       parsed = JSON.parse(rawContent);
     } catch (parseError) {
@@ -214,21 +231,29 @@ Output must strictly match this JSON schema:
     }
 
     const result: DebriefResponse = {
-      comforting_response:
-        typeof parsed.comforting_response === "string" && parsed.comforting_response.length > 0
-          ? parsed.comforting_response
+      assistant_response:
+        typeof parsed.assistant_response === "string" && parsed.assistant_response.length > 0
+          ? parsed.assistant_response
           : "Your mind has carried enough today. Allow yourself to release tension and drift into sleep.",
-      parked_tasks: Array.isArray(parsed.parked_tasks)
-        ? parsed.parked_tasks.filter((t) => typeof t === "string" && t.trim().length > 0)
+      tasks: Array.isArray(parsed.tasks)
+        ? parsed.tasks.filter((t: any) => t && typeof t.text === "string" && t.text.trim().length > 0).map((t: any) => ({ text: t.text.trim(), priority: t.priority || "normal" }))
         : [],
+      next_question: typeof parsed.next_question === "string" ? parsed.next_question : "",
+      session_complete: Boolean(parsed.session_complete),
+      should_offer_story: Boolean(parsed.should_offer_story),
       story_text: typeof parsed.story_text === "string" ? parsed.story_text : "",
     };
 
-    if (result.parked_tasks.length > 0) {
+    if (result.tasks.length > 0) {
       try {
-        await saveParkedTasks(result.parked_tasks, mongoUri);
+        const taskStrings = result.tasks.map(t => t.text);
+        console.log("[MONGO] saving tasks:", taskStrings);
+        await saveParkedTasks(taskStrings, mongoUri);
+        console.log("[MONGO] tasks saved successfully");
       } catch (dbErr) {
         console.warn("Error saving tasks to MongoDB:", dbErr);
+        // Do NOT claim task was saved if it failed
+        result.assistant_response = "I couldn't safely park that one just now, so I don't want you to rely on me remembering it. " + result.assistant_response;
       }
     }
 
