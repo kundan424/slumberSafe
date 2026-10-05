@@ -29,3 +29,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local md files
+SLUMBERSAFE_PROJECT_BLUEPRINT.md
+PRD.md
+SPEC.md
+AGENTS.md
