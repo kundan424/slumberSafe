@@ -2,9 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import Groq from "groq-sdk";
 import { saveParkedTasks } from "@/lib/mongodb";
 
+interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
 interface DebriefRequestBody {
-  transcript?: string;
+  messages?: Array<{ role: "user" | "assistant"; content: string }>;
   storyTopic?: string;
+  isReadyForSleep?: boolean;
   groqApiKey?: string;
   mongoUri?: string;
 }
@@ -15,10 +21,16 @@ interface DebriefResponse {
   story_text: string;
 }
 
-// Smart offline task extractor and storyteller when GROQ_API_KEY is not set
-function generateDynamicDebrief(transcript: string, storyTopic: string): DebriefResponse {
+// Smart offline conversational engine when GROQ_API_KEY is not configured
+function generateDynamicDebrief(
+  messages: Array<{ role: "user" | "assistant"; content: string }>,
+  storyTopic: string,
+  isReadyForSleep: boolean
+): DebriefResponse {
   const tasks: string[] = [];
-  const text = transcript.trim();
+  const lastUserMessage = messages.slice().reverse().find(m => m.role === "user")?.content || "";
+  const text = lastUserMessage.trim();
+  const lower = text.toLowerCase();
 
   // Pattern matching for actionable items in conversational speech
   const actionablePatterns = [
@@ -32,49 +44,59 @@ function generateDynamicDebrief(transcript: string, storyTopic: string): Debrief
     let match;
     while ((match = pattern.exec(text)) !== null) {
       const candidate = match[0].trim();
-      const cleaned = candidate.replace(/^(i\s+need\s+to|i\s+have\s+to|need\s+to|have\s+to)\s+/i, "");
+      const cleaned = candidate.replace(
+        /^(i\s+need\s+to|i\s+have\s+to|need\s+to|have\s+to)\s+/i,
+        ""
+      );
       const formatted = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
-      if (formatted.length > 4 && !tasks.includes(formatted)) {
+      if (formatted.length > 3 && !tasks.includes(formatted)) {
         tasks.push(formatted);
       }
     }
   }
 
-  // If user entered short direct to-do (e.g. "Send report to Mark")
+  // If user entered short direct to-do item
   if (tasks.length === 0 && text.length > 0) {
     const lines = text.split(/[.\n;]+/).map((s) => s.trim()).filter((s) => s.length > 3);
     for (const line of lines) {
       if (
-        /^(buy|call|send|finish|review|meet|email|pay|schedule|clean|submit|do|pick up)/i.test(line) ||
-        line.length <= 80
+        /^(buy|call|send|finish|review|meet|email|pay|schedule|clean|submit|do|pick up)/i.test(
+          line
+        ) ||
+        (line.length <= 60 && !/^(no|yes|nothing|goodnight|sleep|ready)/i.test(line))
       ) {
         tasks.push(line.charAt(0).toUpperCase() + line.slice(1));
       }
     }
   }
 
-  // Dynamic empathetic response
-  let comforting_response = "";
-  if (tasks.length > 0) {
-    comforting_response = `I have locked away those ${tasks.length} task${tasks.length > 1 ? "s" : ""} safely for tomorrow morning. Your mind is officially off the clock tonight—let tomorrow take care of itself.`;
-  } else if (text.length > 0) {
-    comforting_response = `Your mind has carried so much today. Every thought you just spoke is safe to put down now. Take a deep, gentle breath and let your shoulders melt into rest.`;
-  } else {
-    comforting_response = `I am right here with you. Close your eyes, let go of the day, and allow yourself to gently drift away into sleep.`;
-  }
+  const wantsSleep =
+    isReadyForSleep ||
+    /\b(sleep|story|goodnight|ready to sleep|no that's all|nothing else|that is all|that's it|all for tonight)\b/i.test(
+      lower
+    );
 
-  // Dynamic sensory sleep story generator
+  let comforting_response = "";
   let story_text = "";
-  const topic = storyTopic.trim();
-  if (topic) {
-    story_text = `Picture ${topic.toLowerCase()}. Soft, rhythmic whispers of evening mist drift slowly through the quiet air. A gentle, reassuring warmth settles all around you, easing away the friction of today. Every breath you take grows deeper and slower as stillness blankets the scene. The world outside is peaceful, your thoughts are safe, and it is time now to close your eyes and rest.`;
-  } else if (/story|tell me/i.test(text)) {
-    story_text = `A warm, quiet cabin sits nestled deep inside a starlit pine forest. Outside, a gentle mountain rain taps soothingly against the windowpane, like a lullaby sung just for you. An amber fire crackles quietly in the hearth, filling the room with comforting cedar scent. Breathe in slowly, feel the day melt into the shadows, and let yourself drift into deep, uninterrupted sleep.`;
+
+  if (wantsSleep) {
+    comforting_response =
+      "Your mind has emptied everything it needed to tonight. Close your eyes, let your shoulders melt into bed, and listen as the quiet night carries you into sleep.";
+    const topic = storyTopic.trim() || "a quiet rainy harbor in Maine";
+    story_text = `Picture ${topic.toLowerCase()}. Soft, rhythmic whispers of evening mist drift slowly through the quiet air. A gentle, reassuring warmth settles all around you, easing away every lingering thought of today. Every breath you take grows deeper, slower, and lighter as stillness blankets the room. The world outside is peaceful, your tasks are locked safely away, and your mind is completely free to rest.`;
+  } else {
+    if (tasks.length > 0) {
+      comforting_response = `I've saved those ${tasks.length} task${tasks.length > 1 ? "s" : ""} for tomorrow. You don't need to carry them tonight.`;
+    } else if (text.length > 0) {
+      comforting_response = `I hear you. It's safe to set that down now.`;
+    } else {
+      comforting_response = "Take your time. I'm listening.";
+    }
   }
 
   return {
     comforting_response,
-    parked_tasks: tasks.slice(0, 5), // top tasks
+    parked_tasks: tasks.slice(0, 5),
     story_text,
   };
 }
@@ -82,8 +104,11 @@ function generateDynamicDebrief(transcript: string, storyTopic: string): Debrief
 export async function POST(req: NextRequest) {
   try {
     const body: DebriefRequestBody = await req.json();
-    const transcript = (body.transcript || "").trim();
+    console.log("[DEBRIEF] Received Request:", JSON.stringify(body, null, 2));
+
+    const messages = body.messages || [];
     const storyTopic = (body.storyTopic || "").trim();
+    const isReadyForSleep = Boolean(body.isReadyForSleep);
 
     const apiKey =
       body.groqApiKey ||
@@ -95,9 +120,13 @@ export async function POST(req: NextRequest) {
       req.headers.get("x-mongo-uri") ||
       process.env.MONGODB_URI;
 
-    // If Groq API key is not supplied, use our smart dynamic NLP engine
+    // Offline / fallback dynamic engine
     if (!apiKey) {
-      const dynamicResult = generateDynamicDebrief(transcript, storyTopic);
+      const dynamicResult = generateDynamicDebrief(
+        messages,
+        storyTopic,
+        isReadyForSleep
+      );
       if (dynamicResult.parked_tasks.length > 0) {
         try {
           await saveParkedTasks(dynamicResult.parked_tasks, mongoUri);
@@ -111,33 +140,54 @@ export async function POST(req: NextRequest) {
     // Call Groq Llama 3.3 Versatile
     const groq = new Groq({ apiKey });
 
-    const systemPrompt = `You are SlumberSafe, a soothing, empathetic bedtime decompression companion.
-Your goal is to help a tired, anxious user empty their mind so they can fall asleep peacefully.
+    const systemPrompt = `You are SlumberSafe, a soothing, empathetic bedtime companion.
+You are having an ongoing, spoken bedside conversation with a tired user lying in bed.
 
-Input: The user's late-night spoken thoughts, anxieties, or to-dos.
-Optional Story Topic: ${storyTopic ? `"${storyTopic}"` : "None provided"}
+Your personality:
+- Calm, warm, and natural. Like a gentle human listener, not a customer service bot.
+- Do NOT say "How can I help you?", "Tell me more", or act like a productivity assistant.
+- Do NOT repeat the user's entire transcript back to them.
+- Keep your responses short (1-2 sentences). The user is trying to sleep.
 
-Instructions:
-1. Provide a comforting, warm, empathetic response acknowledging their feelings (comforting_response: 1-2 calm reassuring sentences, max 40 words). Reassure them that tomorrow will be fine and their work is done for tonight.
-2. Extract any concrete, actionable tasks they mentioned so they do not have to keep them in memory (parked_tasks array of strings). If no actionable tasks were mentioned, return an empty array [].
-3. If a storyTopic is provided (or if the user asked for a story in their speech), generate a 100-word peaceful, sensory-rich, low-stimulation bedtime story scene (story_text). Use gentle imagery (gentle rain, soft moonlight, rustling leaves, quiet harbor). Avoid excitement, plot twists, or danger. End with an invitation to close eyes and rest. If no story topic or request is present, return an empty string "".
+Your goals:
+1. Empathize with their thoughts in 1-2 calm, conversational sentences. Reassure them that tomorrow will be fine.
+2. Extract any concrete, actionable tasks from what they said and put them in the "parked_tasks" array. If none, return [].
+3. Check if the user is ready to sleep (they explicitly say "goodnight", "ready to sleep", "tell me a story", or isReadyForSleep is true):
+   - If they ARE ready to sleep: set "story_text" to a peaceful 100-word low-stimulation bedtime scene based on the topic. Provide a very short comforting_response inviting them to close their eyes.
+   - If they are NOT yet ready for sleep: acknowledge their thoughts briefly and naturally pause. Leave "story_text" empty. DO NOT forcefully push for a sleep story if they are just venting.
 
 Output must strictly match this JSON schema:
 {
-  "comforting_response": "1-2 warm empathetic sentences reassuring the user.",
+  "comforting_response": "1-2 warm conversational sentences. (DO NOT ask for a story topic unless they are ready for sleep)",
   "parked_tasks": ["task 1", "task 2"],
-  "story_text": "100-word calming story if topic provided, otherwise empty string."
+  "story_text": "100-word calming story if ready for sleep, otherwise empty string."
 }`;
+
+    const formattedMessages: ChatMessage[] = [
+      { role: "system", content: systemPrompt },
+    ];
+
+    // Append all past turns
+    for (const h of messages) {
+      formattedMessages.push({
+        role: h.role === "user" ? "user" : "assistant",
+        content: h.content,
+      });
+    }
+
+    // If there's an explicit force sleep override, we can append a system hint
+    if (isReadyForSleep) {
+      formattedMessages.push({
+        role: "system",
+        content: `Hint: The user clicked 'Ready for Sleep Story'. Generate the story now using topic: "${storyTopic || "gentle rain"}".`,
+      });
+    }
+
+    console.log("[DEBRIEF] Sending to LLM:", JSON.stringify(formattedMessages, null, 2));
 
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: `Bedside transcript: "${transcript}"\nStory topic requested: "${storyTopic}"`,
-        },
-      ],
+      messages: formattedMessages as any,
       response_format: { type: "json_object" },
       temperature: 0.5,
       max_tokens: 600,
@@ -148,13 +198,19 @@ Output must strictly match this JSON schema:
     if (rawContent.startsWith("```")) {
       rawContent = rawContent.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
     }
+    
+    console.log("[DEBRIEF] LLM Raw Response:", rawContent);
 
     let parsed: DebriefResponse;
     try {
       parsed = JSON.parse(rawContent);
     } catch (parseError) {
       console.warn("Failed to parse JSON from Groq, using dynamic fallback:", parseError);
-      parsed = generateDynamicDebrief(transcript, storyTopic);
+      parsed = generateDynamicDebrief(
+        messages,
+        storyTopic,
+        isReadyForSleep
+      );
     }
 
     const result: DebriefResponse = {
@@ -168,7 +224,6 @@ Output must strictly match this JSON schema:
       story_text: typeof parsed.story_text === "string" ? parsed.story_text : "",
     };
 
-    // Store actionable parked tasks in MongoDB Atlas or shared memory store
     if (result.parked_tasks.length > 0) {
       try {
         await saveParkedTasks(result.parked_tasks, mongoUri);
@@ -181,9 +236,11 @@ Output must strictly match this JSON schema:
   } catch (error: any) {
     console.error("Error in /api/debrief, falling back to dynamic parser:", error);
     const dynamicResult = generateDynamicDebrief(
-      (req as any).body?.transcript || "",
-      (req as any).body?.storyTopic || ""
+      (req as any).body?.messages || [],
+      (req as any).body?.storyTopic || "",
+      false
     );
     return NextResponse.json(dynamicResult);
   }
 }
+

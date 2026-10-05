@@ -14,11 +14,11 @@ export async function POST(req: NextRequest) {
       req.headers.get("x-elevenlabs-key") ||
       process.env.ELEVENLABS_API_KEY;
 
-    const selectedVoiceId =
+    let selectedVoiceId =
       voiceId ||
       req.headers.get("x-voice-id") ||
       process.env.ELEVENLABS_VOICE_ID ||
-      "21m00Tcm4TlvDq8ikWAM"; // Rachel (calm bedtime voice)
+      "21m00Tcm4TlvDq8ikWAM"; // Rachel (Free premade voice)
 
     if (!apiKey) {
       return NextResponse.json(
@@ -31,25 +31,38 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const elevenLabsUrl = `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}`;
-
-    const response = await fetch(elevenLabsUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "xi-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        text: text.trim(),
-        model_id: "eleven_turbo_v2_5",
-        voice_settings: {
-          stability: 0.8,
-          similarity_boost: 0.85,
-          style: 0.25,
-          use_speaker_boost: true,
+    // Helper to synthesize speech
+    const synthesize = async (id: string) => {
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${id}`;
+      return await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "xi-api-key": apiKey,
         },
-      }),
-    });
+        body: JSON.stringify({
+          text: text.trim(),
+          model_id: "eleven_turbo_v2_5",
+          voice_settings: {
+            stability: 0.8,
+            similarity_boost: 0.85,
+            style: 0.25,
+            use_speaker_boost: true,
+          },
+        }),
+      });
+    }
+
+    let response = await synthesize(selectedVoiceId);
+
+    // If 402 Paid Plan Required (e.g. user chose a community library voice which requires paid plan on API)
+    if (!response.ok && response.status === 402 && selectedVoiceId !== "21m00Tcm4TlvDq8ikWAM") {
+      console.warn(
+        `Selected voice ${selectedVoiceId} requires paid subscription. Auto-recovering using free premade voice Rachel...`
+      );
+      selectedVoiceId = "21m00Tcm4TlvDq8ikWAM"; // Rachel is 100% free premade
+      response = await synthesize(selectedVoiceId);
+    }
 
     if (!response.ok) {
       const errText = await response.text();

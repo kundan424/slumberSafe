@@ -4,7 +4,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Mic,
-  MicOff,
   Moon,
   Sun,
   CheckCircle2,
@@ -22,9 +21,17 @@ import {
   Plus,
   X,
   Radio,
+  Send,
+  Coffee,
 } from "lucide-react";
 
-type UIState = "IDLE" | "LISTENING" | "PROCESSING" | "PLAYING_AUDIO" | "MORNING_VIEW";
+type UIState = "IDLE" | "CONVERSING" | "PROCESSING" | "PLAYING_AUDIO" | "MORNING_VIEW";
+
+interface ConversationTurn {
+  role: "user" | "assistant";
+  content: string;
+  tasks?: string[];
+}
 
 interface DebriefData {
   comforting_response: string;
@@ -41,18 +48,21 @@ interface TaskItem {
 
 export default function SlumberSafePage() {
   const [uiState, setUiState] = useState<UIState>("IDLE");
-  const [transcript, setTranscript] = useState("");
+  const [currentInput, setCurrentInput] = useState("");
   const [storyTopic, setStoryTopic] = useState("");
   const [micError, setMicError] = useState<string | null>(null);
-  const [debriefResult, setDebriefResult] = useState<DebriefData | null>(null);
+  const [conversation, setConversation] = useState<ConversationTurn[]>([]);
+  const [allParkedTasks, setAllParkedTasks] = useState<string[]>([]);
+  const [finalDebrief, setFinalDebrief] = useState<DebriefData | null>(null);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [newTaskInput, setNewTaskInput] = useState("");
   const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [currentTimeStr, setCurrentTimeStr] = useState("11:15 PM");
-  const [isSpeakingLive, setIsSpeakingLive] = useState(false);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
-  // User Settings (stored in localStorage)
+  // Settings
   const [groqKey, setGroqKey] = useState("");
   const [elevenlabsKey, setElevenlabsKey] = useState("");
   const [voiceId, setVoiceId] = useState("21m00Tcm4TlvDq8ikWAM"); // Rachel default
@@ -61,14 +71,15 @@ export default function SlumberSafePage() {
   const recognitionRef = useRef<any>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const transcriptRef = useRef("");
+  const isAiSpeakingRef = useRef(false);
+  const isProcessingRef = useRef(false);
+  const conversationRef = useRef<ConversationTurn[]>([]);
 
-  // Keep transcriptRef synced
   useEffect(() => {
-    transcriptRef.current = transcript;
-  }, [transcript]);
+    conversationRef.current = conversation;
+  }, [conversation]);
 
-  // Load stored credentials on mount
+  // Load stored credentials
   useEffect(() => {
     if (typeof window !== "undefined") {
       setGroqKey(localStorage.getItem("slumber_groq_key") || "");
@@ -122,116 +133,142 @@ export default function SlumberSafePage() {
     }
   }, [uiState, loadTasks]);
 
-  // Bedside Audio Synthesizer (ElevenLabs + soft browser speech fallback)
-  const speakBedsideAudio = async (text: string, onEnd?: () => void) => {
+  // Synthesize audio with ElevenLabs & fallback
+  const speakBedsideAudio = (text: string, onEnd?: () => void) => {
     if (isAudioMuted || !text.trim()) {
       if (onEnd) onEnd();
       return;
     }
 
-    try {
-      const res = await fetch("/api/tts", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(elevenlabsKey ? { "x-elevenlabs-key": elevenlabsKey } : {}),
-          ...(voiceId ? { "x-voice-id": voiceId } : {}),
-        },
-        body: JSON.stringify({
-          text: text.trim(),
-          voiceId,
-          elevenlabsApiKey: elevenlabsKey,
-        }),
-      });
+    setIsAiSpeaking(true);
+    isAiSpeakingRef.current = true;
 
-      if (res.ok && res.headers.get("content-type")?.includes("audio")) {
-        const blob = await res.blob();
+    const finalize = () => {
+      setIsAiSpeaking(false);
+      isAiSpeakingRef.current = false;
+      if (onEnd) onEnd();
+    };
+
+    fetch("/api/tts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(elevenlabsKey ? { "x-elevenlabs-key": elevenlabsKey } : {}),
+        ...(voiceId ? { "x-voice-id": voiceId } : {}),
+      },
+      body: JSON.stringify({
+        text: text.trim(),
+        voiceId,
+        elevenlabsApiKey: elevenlabsKey,
+      }),
+    })
+      .then((res) => {
+        if (res.ok && res.headers.get("content-type")?.includes("audio")) {
+          return res.blob();
+        }
+        throw new Error("Fallback needed");
+      })
+      .then((blob) => {
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         audioRef.current = audio;
-        audio.onended = () => {
-          if (onEnd) onEnd();
-        };
-        audio.play().catch(() => {});
-        return;
-      }
-    } catch (err) {
-      console.warn("ElevenLabs audio request failed:", err);
-    }
-
-    // Fallback: gentle browser speech synthesis with slow whispered rate
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 0.85;
-      utterance.pitch = 0.95;
-      const voices = window.speechSynthesis.getVoices();
-      const naturalVoice = voices.find(
-        (v) => v.name.includes("Natural") || v.name.includes("Google") || v.name.includes("English")
-      );
-      if (naturalVoice) utterance.voice = naturalVoice;
-      utterance.onend = () => {
-        if (onEnd) onEnd();
-      };
-      window.speechSynthesis.speak(utterance);
-    } else {
-      if (onEnd) onEnd();
-    }
+        audio.onended = finalize;
+        audio.onerror = finalize;
+        audio.play().catch(finalize);
+      })
+      .catch(() => {
+        // Fallback: Web Speech synthesis with soft whisper cadence
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(text);
+          utterance.rate = 0.84;
+          utterance.pitch = 0.95;
+          const voices = window.speechSynthesis.getVoices();
+          const softVoice = voices.find(
+            (v) =>
+              v.name.includes("Natural") ||
+              v.name.includes("Google") ||
+              v.name.includes("English")
+          );
+          if (softVoice) utterance.voice = softVoice;
+          utterance.onend = finalize;
+          utterance.onerror = finalize;
+          window.speechSynthesis.speak(utterance);
+        } else {
+          finalize();
+        }
+      });
   };
 
-  // Start Bedside Speech Recognition (Continuous + Hands-free Silence Detection)
-  const startSpeechRecognition = () => {
+  // Continuous speech recognition with anti-echo and silence detection
+  const startListening = () => {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setMicError("Browser speech recognition is not supported here. Feel free to type below.");
+      setMicError("Browser speech recognition is not supported. Please type below.");
       return;
     }
 
     try {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+      }
+
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = "en-US";
 
       recognition.onresult = (event: any) => {
+        // Echo cancellation: Ignore input while AI is speaking or processing
+        if (isAiSpeakingRef.current || isProcessingRef.current) return;
+
         let full = "";
         for (let i = 0; i < event.results.length; i++) {
           full += event.results[i][0].transcript + " ";
         }
         const updated = full.trim();
-        setTranscript(updated);
-        setIsSpeakingLive(true);
+        if (updated) {
+          setCurrentInput(updated);
+          setIsUserSpeaking(true);
 
-        // Hands-Free Gemini Live Silence Detection:
-        // Automatically process thoughts after 2.8s of silence so the user never has to click in bed!
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        if (updated.length > 5) {
-          silenceTimerRef.current = setTimeout(() => {
-            setIsSpeakingLive(false);
-            processDebrief(updated);
-          }, 2800);
+          // Hands-free Gemini Live silence detection: auto-submit after 3.2s pause
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          if (updated.length > 6) {
+            silenceTimerRef.current = setTimeout(() => {
+              console.log("[STT] Final transcript captured:", updated);
+              setIsUserSpeaking(false);
+              handleSendTurn(updated);
+            }, 3200);
+          }
         }
       };
 
       recognition.onerror = (event: any) => {
-        console.warn("Mic recognition error:", event.error);
         if (event.error === "not-allowed") {
-          setMicError("Microphone access is blocked. You can type in the box below.");
+          setMicError("Microphone permission denied. You can type below.");
         }
       };
 
       recognition.onend = () => {
-        setIsSpeakingLive(false);
+        setIsUserSpeaking(false);
+        // Automatically restart listening if still in CONVERSING state, not speaking, and not processing
+        if (uiState === "CONVERSING" && !isAiSpeakingRef.current && !isProcessingRef.current) {
+          try {
+            recognition.start();
+          } catch {}
+        }
       };
 
       recognition.start();
       recognitionRef.current = recognition;
       setMicError(null);
     } catch (err) {
-      console.error("Speech init failure:", err);
-      setMicError("Could not start microphone. Please type below.");
+      console.error("Speech recognition error:", err);
+      setMicError("Could not start microphone. Feel free to type below.");
     }
   };
 
@@ -242,33 +279,54 @@ export default function SlumberSafePage() {
     }
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onend = null; // Prevent it from auto-restarting
         recognitionRef.current.stop();
       } catch {}
       recognitionRef.current = null;
     }
-    setIsSpeakingLive(false);
+    setIsUserSpeaking(false);
   };
 
-  // Bedside Greeting + Auto-Listen (Conversational Gemini Live Experience)
+  // Start Bedside Wind-Down Conversation
   const handleStartWindDown = () => {
-    setTranscript("");
-    setUiState("LISTENING");
-    const greeting =
-      "I'm listening. Take a gentle, deep breath, and tell me whatever is on your mind tonight.";
+    setConversation([]);
+    setAllParkedTasks([]);
+    setFinalDebrief(null);
+    setCurrentInput("");
+    setUiState("CONVERSING");
+
+    const greeting = "I'm here. Take your time and tell me what's on your mind.";
+
+    // Add greeting to conversation feed
+    setConversation([{ role: "assistant", content: greeting }]);
+
+    // Speak greeting, then automatically begin listening for user response
     speakBedsideAudio(greeting, () => {
-      startSpeechRecognition();
+      startListening();
     });
-    // Start mic in parallel so user speech isn't lost if they speak right away
-    startSpeechRecognition();
   };
 
-  // Submit Spoken Debrief to Groq Llama 3.3 Engine
-  const processDebrief = async (textToProcess?: string) => {
-    stopListening();
-    const activeText = (textToProcess !== undefined ? textToProcess : transcriptRef.current).trim();
-    if (!activeText && !storyTopic.trim()) return;
+  // Send a Conversational Turn (Dictate stresses, tasks, thoughts)
+  const handleSendTurn = async (inputText?: string, forceSleep: boolean = false) => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
 
-    setUiState("PROCESSING");
+    const textToSend = (inputText !== undefined ? inputText : currentInput).trim();
+    if (!textToSend && !forceSleep) return;
+
+    // Temporarily pause listening while AI is thinking
+    isProcessingRef.current = true;
+    stopListening();
+    setCurrentInput("");
+
+    const newHistory = [
+      ...conversationRef.current,
+      ...(textToSend ? [{ role: "user" as const, content: textToSend }] : []),
+    ];
+    setConversation(newHistory);
+
     try {
       const res = await fetch("/api/debrief", {
         method: "POST",
@@ -278,30 +336,59 @@ export default function SlumberSafePage() {
           ...(mongoUri ? { "x-mongo-uri": mongoUri } : {}),
         },
         body: JSON.stringify({
-          transcript: activeText,
+          messages: newHistory,
           storyTopic,
+          isReadyForSleep: forceSleep,
           groqApiKey: groqKey,
           mongoUri,
         }),
       });
 
       const data: DebriefData = await res.json();
-      setDebriefResult(data);
-      setUiState("PLAYING_AUDIO");
+      console.log("[DEBRIEF] Response data:", data);
 
-      // Auto-play bedtime comforting response & story
-      const speechScript = [data.comforting_response, data.story_text].filter(Boolean).join(" ");
-      if (speechScript) {
-        speakBedsideAudio(speechScript);
+      // Accumulate any extracted tasks
+      if (data.parked_tasks && data.parked_tasks.length > 0) {
+        setAllParkedTasks((prev) => [
+          ...prev,
+          ...data.parked_tasks.filter((t) => !prev.includes(t)),
+        ]);
+      }
+
+      // Check if user is ready for sleep story
+      if (data.story_text || forceSleep) {
+        setFinalDebrief(data);
+        setUiState("PLAYING_AUDIO");
+        const finalScript = [data.comforting_response, data.story_text]
+          .filter(Boolean)
+          .join(" ");
+        speakBedsideAudio(finalScript);
+      } else {
+        // Continue conversation: AI speaks and then prompts user for next turn
+        setConversation((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: data.comforting_response,
+            tasks: data.parked_tasks,
+          },
+        ]);
+
+        speakBedsideAudio(data.comforting_response, () => {
+          // AI finished speaking; resume listening for user's next thoughts!
+          isProcessingRef.current = false;
+          if (uiState === "CONVERSING") startListening();
+        });
       }
     } catch (err) {
-      console.error("Debrief processing error:", err);
-      setDebriefResult({
-        comforting_response: "Breathe slowly. Your racing mind is safe to pause and rest tonight.",
-        parked_tasks: [],
-        story_text: "",
+      console.error("Turn processing error:", err);
+      const fallbackMsg =
+        "Your thoughts are safe with me. Let your mind pause and take a gentle breath.";
+      setConversation((prev) => [...prev, { role: "assistant", content: fallbackMsg }]);
+      speakBedsideAudio(fallbackMsg, () => {
+        isProcessingRef.current = false;
+        if (uiState === "CONVERSING") startListening();
       });
-      setUiState("PLAYING_AUDIO");
     }
   };
 
@@ -354,15 +441,15 @@ export default function SlumberSafePage() {
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
-    setTranscript("");
-    setStoryTopic("");
-    setDebriefResult(null);
+    setCurrentInput("");
+    setConversation([]);
+    setFinalDebrief(null);
     setUiState("IDLE");
   };
 
   return (
     <main className="min-h-screen bg-black text-zinc-100 flex flex-col justify-between max-w-md mx-auto p-5 select-none relative font-sans">
-      {/* Bedside Ambient Glow */}
+      {/* Bedside Glow */}
       <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-72 h-72 bg-indigo-950/20 rounded-full blur-3xl pointer-events-none" />
 
       {/* Header */}
@@ -444,21 +531,24 @@ export default function SlumberSafePage() {
               </div>
 
               <div>
-                <label className="text-zinc-400 block mb-1">ElevenLabs Voice ID:</label>
-                <div className="flex space-x-1 mb-1">
+                <label className="text-zinc-400 block mb-1">
+                  Bedside Voice (100% Free Premade Voices):
+                </label>
+                <div className="grid grid-cols-2 gap-1.5 mb-1.5">
                   {[
-                    { name: "Rachel", id: "21m00Tcm4TlvDq8ikWAM" },
-                    { name: "Charlotte", id: "XB0fDUnXU5powFXDhCwa" },
-                    { name: "George", id: "JBFqnCBsd6RMkjVDRZzb" },
+                    { name: "Rachel (Calm)", id: "21m00Tcm4TlvDq8ikWAM" },
+                    { name: "Bella (Whisper)", id: "EXAVITQu4vr4xnSDxMaL" },
+                    { name: "Adam (Warm Male)", id: "pNInz6obpgDQGcFmaJgB" },
+                    { name: "Antoni (Soft)", id: "ErXwobaYiN019PkySvjV" },
                   ].map((v) => (
                     <button
                       key={v.id}
                       type="button"
                       onClick={() => setVoiceId(v.id)}
-                      className={`px-2 py-1 rounded text-[10px] border transition ${
+                      className={`px-2 py-1.5 rounded-lg text-[11px] border text-left transition ${
                         voiceId === v.id
-                          ? "bg-indigo-950 text-indigo-300 border-indigo-700"
-                          : "bg-zinc-900 text-zinc-500 border-zinc-800"
+                          ? "bg-indigo-950/80 text-indigo-300 border-indigo-600"
+                          : "bg-zinc-900 text-zinc-400 border-zinc-800 hover:border-zinc-700"
                       }`}
                     >
                       {v.name}
@@ -496,23 +586,21 @@ export default function SlumberSafePage() {
         </div>
       )}
 
-      {/* Main Body */}
-      <div className="flex-1 flex flex-col justify-center my-6 z-10">
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col justify-center my-4 z-10">
         {/* 1. IDLE STATE */}
         {uiState === "IDLE" && (
           <div className="flex flex-col items-center text-center space-y-6">
-            {/* Late-Night Doomscroll Interceptor Banner */}
             <div className="w-full bg-gradient-to-b from-indigo-950/40 to-zinc-900/40 border border-indigo-900/40 rounded-2xl p-4 text-left shadow-lg">
               <div className="flex items-center space-x-2 text-indigo-300 text-xs font-semibold uppercase tracking-wider mb-2">
                 <BedDouble className="w-4 h-4 text-indigo-400" />
                 <span>Late-Night Interceptor • {currentTimeStr}</span>
               </div>
               <p className="text-sm text-zinc-300 leading-relaxed">
-                You’ve been scrolling in bed. Your brain deserves rest. Put your phone face-down and start tonight’s voice debrief.
+                You’ve been scrolling in bed. Your brain deserves rest. Put your phone face-down and start tonight’s conversational voice wind-down.
               </p>
             </div>
 
-            {/* Pulsing Start Wind-Down Button */}
             <div className="py-6 flex flex-col items-center">
               <button
                 onClick={handleStartWindDown}
@@ -526,11 +614,10 @@ export default function SlumberSafePage() {
                 </div>
               </button>
               <p className="text-xs text-zinc-500 mt-4">
-                Hands-free voice companion • Greet & speak from bed
+                Conversational Bedside Debrief • Hands-free voice
               </p>
             </div>
 
-            {/* Bedtime Story Topic Input */}
             <div className="w-full text-left space-y-2">
               <label className="text-xs text-zinc-400 flex items-center space-x-1.5">
                 <Sparkles className="w-3.5 h-3.5 text-amber-400" />
@@ -547,95 +634,147 @@ export default function SlumberSafePage() {
           </div>
         )}
 
-        {/* 2. LISTENING STATE (Conversational Hands-Free Voice) */}
-        {uiState === "LISTENING" && (
-          <div className="flex flex-col items-center space-y-6">
-            <div className="flex items-center space-x-2 text-xs text-emerald-400 uppercase tracking-widest font-semibold">
-              <Radio className="w-4 h-4 animate-pulse" />
-              <span>{isSpeakingLive ? "Listening to Your Voice..." : "Ready & Listening"}</span>
-            </div>
-
-            {/* Soundwave Animation */}
-            <div className="flex items-end justify-center space-x-2 h-16 py-2">
-              <div className={`soundwave-bar ${isSpeakingLive ? "animate-wave-1" : "h-3 opacity-40"}`} />
-              <div className={`soundwave-bar ${isSpeakingLive ? "animate-wave-2" : "h-5 opacity-40"}`} />
-              <div className={`soundwave-bar ${isSpeakingLive ? "animate-wave-3" : "h-7 opacity-40"}`} />
-              <div className={`soundwave-bar ${isSpeakingLive ? "animate-wave-4" : "h-5 opacity-40"}`} />
-              <div className={`soundwave-bar ${isSpeakingLive ? "animate-wave-2" : "h-3 opacity-40"}`} />
-            </div>
-
-            <p className="text-[11px] text-zinc-400 text-center italic">
-              Speak naturally. SlumberSafe auto-detects when you finish speaking.
-            </p>
-
-            {/* Live Transcript & Fallback Input */}
-            <div className="w-full space-y-2">
-              <label className="text-xs text-zinc-400 flex items-center justify-between">
-                <span>Spoken Thoughts & To-Dos:</span>
-                <span className="text-[11px] text-zinc-500">Live Voice Transcription</span>
-              </label>
-              <textarea
-                rows={4}
-                value={transcript}
-                onChange={(e) => setTranscript(e.target.value)}
-                placeholder="Speak aloud or type your racing thoughts here... e.g. 'I need to send the report to Mark and buy groceries tomorrow.'"
-                className="w-full bg-zinc-900/80 border border-zinc-800 rounded-2xl p-3.5 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 transition resize-none"
-              />
-              {micError && (
-                <p className="text-xs text-amber-400 bg-amber-950/30 p-2.5 rounded-xl border border-amber-900/50">
-                  {micError}
-                </p>
-              )}
-            </div>
-
-            {/* Actions */}
-            <div className="w-full flex space-x-3 pt-2">
-              <button
-                onClick={resetSession}
-                className="flex-1 py-3 px-4 rounded-xl bg-zinc-900 text-zinc-400 text-sm hover:bg-zinc-800 transition"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => processDebrief()}
-                className="flex-2 py-3 px-6 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm transition flex items-center justify-center space-x-2"
-              >
-                <span>Lock Away & Sleep</span>
-                <ArrowRight className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* 3. PROCESSING STATE */}
-        {uiState === "PROCESSING" && (
-          <div className="flex flex-col items-center justify-center text-center space-y-4 py-16">
-            <div className="w-16 h-16 rounded-full border-2 border-indigo-500/20 border-t-indigo-500 animate-spin flex items-center justify-center">
-              <Moon className="w-6 h-6 text-indigo-400 animate-pulse" />
-            </div>
-            <h2 className="text-base font-medium text-zinc-200">
-              Soothing your mind...
-            </h2>
-            <p className="text-xs text-zinc-500 max-w-xs">
-              Separating worries from tasks and locking them safely away for tomorrow morning.
-            </p>
-          </div>
-        )}
-
-        {/* 4. PLAYING AUDIO / RESULTS STATE */}
-        {uiState === "PLAYING_AUDIO" && debriefResult && (
-          <div className="space-y-5 animate-in fade-in duration-500">
-            {/* Audio Voice Playing Indicator */}
-            <div className="flex items-center justify-between bg-indigo-950/30 border border-indigo-900/40 rounded-xl px-4 py-3">
-              <div className="flex items-center space-x-2.5 text-xs text-indigo-300">
-                <Volume2 className="w-4 h-4 text-indigo-400 animate-pulse" />
-                <span className="font-medium">Bedside Whispered Voice</span>
+        {/* 2. CONVERSING STATE (Multi-turn Gemini Voice Experience) */}
+        {uiState === "CONVERSING" && (
+          <div className="flex flex-col space-y-3 h-[72vh]">
+            {/* Status Indicator */}
+            <div className="flex items-center justify-between bg-zinc-950/90 border border-zinc-800/80 rounded-xl px-3.5 py-2 text-xs">
+              <div className="flex items-center space-x-2">
+                {isAiSpeaking ? (
+                  <>
+                    <Volume2 className="w-4 h-4 text-indigo-400 animate-pulse" />
+                    <span className="text-indigo-300 font-medium">SlumberSafe is speaking...</span>
+                  </>
+                ) : isProcessingRef.current ? (
+                  <>
+                    <Sparkles className="w-4 h-4 text-indigo-400 animate-pulse" />
+                    <span className="text-indigo-300 font-medium">SlumberSafe is thinking...</span>
+                  </>
+                ) : (
+                  <>
+                    <Radio className="w-4 h-4 text-emerald-400 animate-pulse" />
+                    <span className="text-emerald-400 font-medium">
+                      {isUserSpeaking ? "Hearing your voice..." : "Listening to you (Speak freely)"}
+                    </span>
+                  </>
+                )}
               </div>
               <button
                 onClick={() => {
-                  if (audioRef.current) {
-                    audioRef.current.muted = !isAudioMuted;
+                  if (audioRef.current) audioRef.current.muted = !isAudioMuted;
+                  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                    if (!isAudioMuted) window.speechSynthesis.cancel();
                   }
+                  setIsAudioMuted(!isAudioMuted);
+                }}
+                className="text-zinc-500 hover:text-zinc-300"
+              >
+                {isAudioMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+
+            {/* Conversation Feed */}
+            <div className="flex-1 overflow-y-auto space-y-3 pr-1 py-1">
+              {conversation.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`flex flex-col ${
+                    msg.role === "user" ? "items-end" : "items-start"
+                  }`}
+                >
+                  <div
+                    className={`max-w-[88%] p-3 rounded-2xl text-xs leading-relaxed ${
+                      msg.role === "user"
+                        ? "bg-indigo-950/60 text-indigo-100 border border-indigo-900/50 rounded-br-sm"
+                        : "bg-zinc-900/90 text-zinc-200 border border-zinc-800/80 rounded-bl-sm"
+                    }`}
+                  >
+                    <p>{msg.content}</p>
+                    {msg.tasks && msg.tasks.length > 0 && (
+                      <div className="mt-2 pt-2 border-t border-zinc-800/80 space-y-1">
+                        <span className="text-[10px] text-emerald-400 font-semibold uppercase flex items-center space-x-1">
+                          <Lock className="w-3 h-3" />
+                          <span>Parked for Morning:</span>
+                        </span>
+                        {msg.tasks.map((task, tidx) => (
+                          <div
+                            key={tidx}
+                            className="text-[11px] text-zinc-300 flex items-center space-x-1.5 bg-black/40 px-2 py-1 rounded"
+                          >
+                            <ShieldCheck className="w-3 h-3 text-emerald-400 shrink-0" />
+                            <span>{task}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Live Spoken Input / Fallback Textarea */}
+            <div className="space-y-2 pt-2 border-t border-zinc-900">
+              <div className="relative">
+                <textarea
+                  rows={2}
+                  value={currentInput}
+                  onChange={(e) => setCurrentInput(e.target.value)}
+                  placeholder={
+                    isAiSpeaking
+                      ? "Listening will resume automatically when voice finishes..."
+                      : isProcessingRef.current
+                        ? "Thinking..."
+                        : "Speak your thoughts or type here... (Pauses auto-send)"
+                  }
+                  className="w-full bg-zinc-900/80 border border-zinc-800 rounded-xl p-2.5 pr-10 text-xs text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 transition resize-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => handleSendTurn()}
+                  disabled={!currentInput.trim()}
+                  className="absolute right-2.5 top-2.5 p-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white disabled:opacity-30 transition"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {micError && (
+                <p className="text-[11px] text-amber-400 bg-amber-950/20 px-2 py-1 rounded border border-amber-900/40">
+                  {micError}
+                </p>
+              )}
+
+              {/* Quick Bedside Action Buttons */}
+              <div className="flex space-x-2">
+                <button
+                  onClick={resetSession}
+                  className="py-2.5 px-3 rounded-xl bg-zinc-900 text-zinc-400 text-xs hover:bg-zinc-800 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => handleSendTurn(undefined, true)}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-800 hover:from-indigo-500 hover:to-indigo-700 text-white text-xs font-medium transition flex items-center justify-center space-x-1.5 shadow-lg shadow-indigo-950/60"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                  <span>Ready for Sleep Story</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 3. PLAYING AUDIO / FINAL SLEEP STATE */}
+        {uiState === "PLAYING_AUDIO" && finalDebrief && (
+          <div className="space-y-4 animate-in fade-in duration-500">
+            <div className="flex items-center justify-between bg-indigo-950/30 border border-indigo-900/40 rounded-xl px-4 py-3">
+              <div className="flex items-center space-x-2.5 text-xs text-indigo-300">
+                <Volume2 className="w-4 h-4 text-indigo-400 animate-pulse" />
+                <span className="font-medium">Whispered Sleep Narrator</span>
+              </div>
+              <button
+                onClick={() => {
+                  if (audioRef.current) audioRef.current.muted = !isAudioMuted;
                   if (typeof window !== "undefined" && "speechSynthesis" in window) {
                     if (!isAudioMuted) window.speechSynthesis.cancel();
                   }
@@ -647,26 +786,25 @@ export default function SlumberSafePage() {
               </button>
             </div>
 
-            {/* Comforting Response */}
             <div className="bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-4 space-y-2">
               <span className="text-[11px] font-semibold text-emerald-400 uppercase tracking-wider flex items-center space-x-1">
                 <Feather className="w-3.5 h-3.5" />
                 <span>Comforting Words</span>
               </span>
               <p className="text-sm text-zinc-200 italic leading-relaxed">
-                &ldquo;{debriefResult.comforting_response}&rdquo;
+                &ldquo;{finalDebrief.comforting_response}&rdquo;
               </p>
             </div>
 
-            {/* Parked Tasks Lockbox Confirmation */}
-            {debriefResult.parked_tasks.length > 0 && (
-              <div className="bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-4 space-y-2.5">
+            {/* Parked Tasks Confirmation */}
+            {allParkedTasks.length > 0 && (
+              <div className="bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-4 space-y-2">
                 <span className="text-[11px] font-semibold text-indigo-400 uppercase tracking-wider flex items-center space-x-1.5">
                   <Lock className="w-3.5 h-3.5" />
-                  <span>Tasks Locked in Atlas ({debriefResult.parked_tasks.length})</span>
+                  <span>Tasks Locked in Atlas ({allParkedTasks.length})</span>
                 </span>
                 <ul className="space-y-1.5">
-                  {debriefResult.parked_tasks.map((task, idx) => (
+                  {allParkedTasks.map((task, idx) => (
                     <li
                       key={idx}
                       className="text-xs text-zinc-300 flex items-center space-x-2 bg-black/40 px-3 py-2 rounded-xl"
@@ -677,38 +815,39 @@ export default function SlumberSafePage() {
                   ))}
                 </ul>
                 <p className="text-[11px] text-zinc-500 pt-1">
-                  Parked safely until morning. Your mind is off the clock.
+                  Safely stored in MongoDB Atlas. Your mind is off the clock.
                 </p>
               </div>
             )}
 
             {/* Bedtime Story */}
-            {debriefResult.story_text && (
+            {finalDebrief.story_text && (
               <div className="bg-zinc-900/70 border border-zinc-800/80 rounded-2xl p-4 space-y-2">
                 <span className="text-[11px] font-semibold text-amber-400 uppercase tracking-wider flex items-center space-x-1">
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>Bedtime Sleep Story</span>
+                  <span>Bedtime Sleep Scene</span>
                 </span>
                 <p className="text-xs text-zinc-300 leading-relaxed">
-                  {debriefResult.story_text}
+                  {finalDebrief.story_text}
                 </p>
               </div>
             )}
 
-            {/* Actions */}
-            <div className="space-y-2">
+            <div className="space-y-2 pt-2">
               <button
                 onClick={() => {
                   const speechScript = [
-                    debriefResult.comforting_response,
-                    debriefResult.story_text,
-                  ].filter(Boolean).join(" ");
+                    finalDebrief.comforting_response,
+                    finalDebrief.story_text,
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
                   speakBedsideAudio(speechScript);
                 }}
                 className="w-full py-2.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-indigo-300 text-xs font-medium transition flex items-center justify-center space-x-2 border border-zinc-800"
               >
                 <Volume2 className="w-3.5 h-3.5" />
-                <span>Replay Bedside Audio</span>
+                <span>Replay Whispered Bedside Audio</span>
               </button>
 
               <button
@@ -722,7 +861,7 @@ export default function SlumberSafePage() {
           </div>
         )}
 
-        {/* 5. MORNING VIEW (MOMENTUM CARD) */}
+        {/* 4. MORNING VIEW (MOMENTUM CARD) */}
         {uiState === "MORNING_VIEW" && (
           <div className="space-y-4 animate-in fade-in duration-300">
             <div className="bg-gradient-to-br from-amber-950/20 to-zinc-900/60 border border-amber-900/30 rounded-2xl p-4">
@@ -735,7 +874,6 @@ export default function SlumberSafePage() {
               </p>
             </div>
 
-            {/* Add Task Manually */}
             <form onSubmit={handleAddManualTask} className="flex space-x-2">
               <input
                 type="text"
